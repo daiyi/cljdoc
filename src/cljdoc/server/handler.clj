@@ -4,6 +4,7 @@
             [cljdoc.cache]
             [cljdoc.renderers.html]
             [clojure.tools.logging :as log]
+            [cljdoc.server.log :as build-log]
             [cljdoc.grimoire-helpers]
             [cljdoc.git-repo]
             [cljdoc.spec]
@@ -156,10 +157,10 @@
                            html-dir     (doto (io/file dir "grimoire-html") (.mkdir))
                            scm-url      (cljdoc.util/scm-url (:pom cljdoc-edn))]
 
-                       (log/info "Verifying cljdoc-edn contents against spec")
+                       (build-log/log "Verifying cljdoc-edn contents against spec")
                        (cljdoc.spec/assert :cljdoc/cljdoc-edn cljdoc-edn)
 
-                       (log/info "Cloning Git repo" scm-url)
+                       (build-log/log (str "Cloning Git repo " scm-url))
                        (when-not (.exists git-dir) ; TODO we should really wipe and start fresh for each build
                          (cljdoc.git-repo/clone scm-url git-dir))
                        (let [repo        (cljdoc.git-repo/->repo git-dir)
@@ -170,14 +171,13 @@
                            (cljdoc.git-repo/git-checkout-repo repo version-tag)
                            (log/warn "No version tag found for version %s in %s\n" version scm-url))
 
-                         (log/info "Importing into Grimoire")
+                         (build-log/log "Importing into Grimoire")
                          (cljdoc.grimoire-helpers/import
                           {:cljdoc-edn   cljdoc-edn
                            :grimoire-dir grimoire-dir
                            :git-repo     repo})
 
-                         (log/info "Rendering HTML")
-                         (log/info "html-dir" html-dir)
+                         (build-log/log "Rendering HTML")
                          (cljdoc.cache/render
                           (cljdoc.renderers.html/->HTMLRenderer)
                           (cljdoc.cache/bundle-docs
@@ -185,18 +185,20 @@
                            (cljdoc.grimoire-helpers/version-thing project version))
                           {:dir html-dir})
 
-                         (log/info "Deploying")
+                         (build-log/log "Deploying")
 
                          (s3/sync! (select-keys s3-deploy [:access-key :secret-key])
                                    (:bucket s3-deploy)
                                    (s3/dir->file-maps html-dir)
-                                   {:report-fn #(log/info %)})
+                                   {:report-fn #(build-log/log %)})
 
-                         (log/infof "Done with build %s" build-id))
+                         (build-log/log (str "Done with build " build-id)))
 
                        (assoc (:response ctx) :status 200))
                      (catch Throwable t
-                       (log/error t "Exception while running full build"))))}}})))
+                       (log/error t "Exception while running full build")
+                       (build-log/spit "ERROR: Exception while running full build")
+                       (build-log/spit (with-out-str (.printStackTrace t))))))}}})))
 
 (def ping-handler
   (yada/handler
@@ -204,6 +206,21 @@
     {:methods
      {:get {:produces "text/plain"
             :response "pong"}}})))
+
+(def build-logs-handler
+  (yada/handler
+   (yada/resource
+    {:methods
+     {:get {:parameters {:query {:id String}}
+            :produces "text/plain"
+            :response (fn [ctx]
+                        (let [id (get-in ctx [:parameters :query :id])]
+                          (if (build-log/exists? id)
+                            (build-log/read id)
+                            ;; TODO fix this
+                            (merge (:response ctx)
+                                   {:status 404
+                                    :body "ERROR: Unknown build ID"}))))}}})))
 
 (defn cljdoc-api-routes [{:keys [circle-ci dir s3-deploy] :as deps}]
   ["" [["/ping"            ping-handler]
@@ -215,6 +232,7 @@
                             {:dir dir
                              :s3-deploy s3-deploy
                              :access-control (cljdoc-acc-control {"cljdoc" "cljdoc"})})]
+       ["/build-logs"      build-logs-handler]
        ]])
 
 (comment
